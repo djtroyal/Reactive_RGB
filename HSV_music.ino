@@ -1,13 +1,15 @@
 /*
- * Music-Reactive HSV LED
+ * Music-Reactive HSV LED — Multi-Mode
  *
- * Generates an HSV color output driven by music/audio from a microphone.
+ * Four display modes toggled by a momentary switch on BTN_PIN (pin 4).
+ * Wire the switch between pin 4 and GND; the internal pull-up does the rest.
  *
- *   Hue   — auto-cycles slowly at rest; jumps on detected beats
- *   Sat   — fixed at 1.0 for vivid, fully-saturated colors
- *   Value — mapped from audio amplitude (louder = brighter)
+ *   Mode 0  BEAT_HUE  — hue auto-drifts; kicks forward on detected beats
+ *   Mode 1  SPECTRUM  — amplitude maps to hue (blue=quiet → red=loud)
+ *   Mode 2  PULSE     — brightness spikes on each beat then decays; hue drifts
+ *   Mode 3  AMBIENT   — slow pastel hue cycle; gentle brightness envelope
  *
- * Pins: R=9, G=10, B=11, Mic=A2
+ * Pins: R=9, G=10, B=11, Mic=A2, Button=4
  */
 
 // --- Pin configuration ---
@@ -15,6 +17,7 @@ const uint8_t RED_PIN   = 9;
 const uint8_t GREEN_PIN = 10;
 const uint8_t BLUE_PIN  = 11;
 const uint8_t MIC_PIN   = A2;
+const uint8_t BTN_PIN   = 4;
 
 // true for common-anode LED (inverts PWM output)
 const bool COMMON_ANODE = false;
@@ -25,13 +28,23 @@ const float GREEN_CAL = 0.9f;
 const float BLUE_CAL  = 1.0f;
 
 // --- Audio parameters ---
-const uint16_t SAMPLE_MS   = 50;  // Sampling window for peak-to-peak amplitude
-const uint16_t NOISE_FLOOR = 20;  // ADC counts below which signal is treated as silence
+const uint16_t SAMPLE_MS   = 50;   // Sampling window for peak-to-peak amplitude
+const uint16_t NOISE_FLOOR = 20;   // ADC counts below which signal is silence
 
-// --- State ---
-float hue       = 0.0f;  // Current hue in degrees (0–360)
-float smoothAmp = 0.0f;  // EMA-smoothed amplitude, drives brightness
-float avgAmp    = 0.0f;  // Long-running average, used for beat detection
+// --- Mode ---
+const uint8_t NUM_MODES = 4;
+uint8_t mode = 0;
+
+// --- Button debounce ---
+bool     btnLast   = HIGH;
+uint32_t btnTime   = 0;
+const uint16_t DEBOUNCE_MS = 200;  // Longer than the 50ms loop period
+
+// --- Shared state ---
+float hue       = 0.0f;   // Current hue in degrees (0–360)
+float smoothAmp = 0.0f;   // Fast EMA — drives brightness
+float avgAmp    = 0.0f;   // Slow EMA — beat detection baseline
+float pulseVal  = 0.0f;   // PULSE mode: decaying brightness envelope
 
 // Returns peak-to-peak amplitude (0–1023) sampled over SAMPLE_MS milliseconds
 uint16_t sampleAmplitude() {
@@ -75,33 +88,70 @@ void setHSV(float h, float s, float v) {
   analogWrite(BLUE_PIN,  bv);
 }
 
+// Advances mode on each falling edge with debounce
+void checkButton() {
+  bool btnNow = digitalRead(BTN_PIN);
+  if (btnNow == LOW && btnLast == HIGH && (millis() - btnTime) > DEBOUNCE_MS) {
+    mode = (mode + 1) % NUM_MODES;
+    btnTime = millis();
+  }
+  btnLast = btnNow;
+}
+
 void setup() {
   pinMode(RED_PIN,   OUTPUT);
   pinMode(GREEN_PIN, OUTPUT);
   pinMode(BLUE_PIN,  OUTPUT);
+  pinMode(BTN_PIN,   INPUT_PULLUP);
 }
 
 void loop() {
+  checkButton();
+
   uint16_t raw = sampleAmplitude();
   if (raw < NOISE_FLOOR) raw = 0;
 
-  // Fast EMA smooths amplitude for stable brightness (α=0.4, ~75ms time constant)
+  // Fast EMA for stable brightness (α=0.4, ~75 ms time constant)
   smoothAmp = 0.4f * raw + 0.6f * smoothAmp;
 
-  // Slow EMA tracks the ambient level for beat detection (~1.3 s time constant at 20 Hz)
+  // Slow EMA for beat detection baseline (~1.3 s time constant at 20 Hz)
   avgAmp = 0.05f * raw + 0.95f * avgAmp;
 
-  // A beat is a transient that spikes well above the running average
+  // Beat: instantaneous amplitude spikes well above the running average
   bool beat = (raw > avgAmp * 1.5f) && (raw > NOISE_FLOOR * 2);
 
-  // Hue drifts slowly always; a beat kicks it proportionally to loudness
-  float step = 0.5f + (beat ? (raw / 1023.0f) * 25.0f : 0.0f);
-  hue = fmod(hue + step, 360.0f);
+  float value;
 
-  // Value: faint idle glow in silence; amplitude scales brightness up to 1.0
-  float value = (raw == 0)
-    ? 0.05f
-    : constrain(0.1f + (smoothAmp / 1023.0f) * 0.9f, 0.1f, 1.0f);
+  switch (mode) {
 
-  setHSV(hue, 1.0f, value);
+    case 0:
+      // BEAT_HUE — hue drifts slowly at rest; detected beats kick it forward
+      hue   = fmod(hue + 0.5f + (beat ? (raw / 1023.0f) * 25.0f : 0.0f), 360.0f);
+      value = (raw == 0) ? 0.05f : constrain(0.1f + (smoothAmp / 1023.0f) * 0.9f, 0.1f, 1.0f);
+      setHSV(hue, 1.0f, value);
+      break;
+
+    case 1:
+      // SPECTRUM — amplitude maps to hue position: blue (quiet) → red (loud)
+      hue   = 240.0f - constrain((smoothAmp / 1023.0f) * 240.0f, 0.0f, 240.0f);
+      value = (raw == 0) ? 0.05f : constrain(0.15f + (smoothAmp / 1023.0f) * 0.85f, 0.15f, 1.0f);
+      setHSV(hue, 1.0f, value);
+      break;
+
+    case 2:
+      // PULSE — on each beat brightness snaps to 1.0 then decays exponentially;
+      // hue drifts slowly so the colour changes between beats
+      hue = fmod(hue + 0.3f, 360.0f);
+      if (beat) pulseVal = 1.0f;
+      pulseVal *= 0.85f;  // ~300 ms decay time constant at 20 Hz
+      setHSV(hue, 1.0f, max(0.05f, pulseVal));
+      break;
+
+    case 3:
+      // AMBIENT — very slow pastel hue cycle; brightness responds gently to volume
+      hue   = fmod(hue + 0.15f, 360.0f);
+      value = constrain(0.08f + (smoothAmp / 1023.0f) * 0.45f, 0.08f, 0.53f);
+      setHSV(hue, 0.75f, value);  // Reduced saturation gives softer pastel tones
+      break;
+  }
 }
