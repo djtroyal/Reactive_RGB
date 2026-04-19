@@ -39,11 +39,35 @@ def audio_callback(indata, frames, time, status):
 
 
 def find_monitor():
-    """Return the device index of the first PulseAudio/PipeWire monitor source."""
-    for i, d in enumerate(sd.query_devices()):
-        if "monitor" in d["name"].lower() and d["max_input_channels"] > 0:
-            return i
+    """Return the device index of the best monitor source, or None."""
+    devices  = sd.query_devices()
+    hostapis = sd.query_hostapis()
+
+    # Prefer a PulseAudio/PipeWire host-API device with "monitor" in the name
+    pulse_api = next(
+        (i for i, a in enumerate(hostapis) if "pulse" in a["name"].lower()), None
+    )
+    for i, d in enumerate(devices):
+        if d["max_input_channels"] > 0 and "monitor" in d["name"].lower():
+            if pulse_api is None or d["hostapi"] == pulse_api:
+                return i
+
+    # Fallback: any input on the PulseAudio host API (default monitor)
+    if pulse_api is not None:
+        api_default = hostapis[pulse_api]["default_input_device"]
+        if api_default >= 0:
+            return api_default
+
     return None
+
+
+def list_devices():
+    print("\nAvailable input devices:")
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0:
+            api = sd.query_hostapis(d["hostapi"])["name"]
+            print(f"  [{i:2d}]  {d['name']}  ({api})")
+    print("\nRe-run with:  python led_emulator.py --device N")
 
 
 # ── Display constants ─────────────────────────────────────────────────────────
@@ -171,12 +195,27 @@ def run(device):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    device = find_monitor()
-    if device is None:
-        print("No monitor source found — using default mic input.")
-        print("Tip: open pavucontrol → Recording tab → set source to")
-        print("     'Monitor of <your output device>'.")
-    else:
-        print(f"Capturing: {sd.query_devices(device)['name']}")
+    import sys
 
+    if "--list-devices" in sys.argv:
+        list_devices()
+        sys.exit(0)
+
+    explicit = None
+    if "--device" in sys.argv:
+        idx = sys.argv.index("--device")
+        try:
+            explicit = int(sys.argv[idx + 1])
+        except (IndexError, ValueError):
+            print("Usage: python led_emulator.py --device N")
+            sys.exit(1)
+
+    device = explicit if explicit is not None else find_monitor()
+
+    if device is None:
+        print("Could not find a monitor/loopback input device.")
+        list_devices()
+        sys.exit(1)
+
+    print(f"Capturing: [{device}] {sd.query_devices(device)['name']}")
     run(device)
